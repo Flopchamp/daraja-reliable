@@ -63,50 +63,88 @@ export type Event =
   | { type: 'deadline_passed' }
   | { type: 'manual_resolve'; to: 'settled' | 'failed' };
 
+/** The part of a charge the rules depend on; the `Charge` row satisfies it structurally. */
+export interface ChargeView {
+  state: State;
+  checkoutRequestId: string | null;
+}
+
 const TERMINAL: ReadonlySet<State> = new Set(['settled', 'failed']);
 const QUERY_FAILURE_LIMIT = 3;
 
+// Events that are Safaricom's evidence about one specific charge. They require an id.
+const NEEDS_CHECKOUT_ID = new Set<Event['type']>(['callback', 'query_result', 'query_failed']);
+
 /** Returns the next state, or null when the event must not change state (audit only). */
-export function next(state: State, e: Event): State | null {
-  if (TERMINAL.has(state)) return null;               // forward-only
+export function next(c: ChargeView, e: Event): State | null {
+  if (TERMINAL.has(c.state)) return null;             // forward-only
+  if (c.checkoutRequestId === null && NEEDS_CHECKOUT_ID.has(e.type)) return null;
 
   switch (e.type) {
-    case 'push_accepted':  return state === 'pending' ? 'awaiting_callback' : null;
-    case 'push_rejected':  return state === 'pending' ? 'failed' : null;
-    case 'push_ambiguous': return state === 'pending' ? 'push_unknown' : null;
+    case 'push_accepted':  return c.state === 'pending' ? 'awaiting_callback' : null;
+    case 'push_rejected':  return c.state === 'pending' ? 'failed' : null;
+    case 'push_ambiguous': return c.state === 'pending' ? 'push_unknown' : null;
 
     case 'callback':
-      // A callback can only be bound to a charge whose checkoutRequestId we stored.
-      return state === 'awaiting_callback' || state === 'unresolved'
+      return c.state === 'awaiting_callback' || c.state === 'unresolved'
         ? (e.resultCode === 0 ? 'settled' : 'failed')
         : null;
 
     case 'query_result':
-      if (state !== 'awaiting_callback') return null;
+      if (c.state !== 'awaiting_callback') return null;
       if (e.resultCode === 'processing') return null;
       return e.resultCode === 0 ? 'settled' : 'failed';
 
     case 'query_failed':
-      return state === 'awaiting_callback' && e.consecutiveFailures >= QUERY_FAILURE_LIMIT
+      return c.state === 'awaiting_callback' && e.consecutiveFailures >= QUERY_FAILURE_LIMIT
         ? 'unresolved' : null;
 
     case 'deadline_passed':
-      return state === 'push_unknown' ? 'unresolved' : null;
+      return c.state === 'push_unknown' ? 'unresolved' : null;
 
     case 'manual_resolve':
-      return state === 'unresolved' ? e.to : null;
+      return c.state === 'unresolved' ? e.to : null;
   }
 }
 ```
 
-Note `unresolved` accepts a real callback: if the customer's payment completes late and the callback carries a stored `checkoutRequestId`, that is evidence from Safaricom, and it is allowed to resolve the charge. It is the only non-terminal state that can be resolved by an event rather than a human.
+### Why `next` takes the charge and not just the state
+
+`unresolved` is reached by two routes, and they are not equally trustworthy.
+
+From `awaiting_callback`, after repeated query failures, the `CheckoutRequestID` is
+stored — so a late callback is genuine evidence from Safaricom and may resolve the
+charge. From `push_unknown` no id was ever stored, because STK Push returns the only
+correlation id in the response that was lost. Nothing can honestly bind there, and
+matching on `(phone, amount, accountRef)` is a heuristic, not proof: two customers can
+pay the same amount against the same reference in the same minute.
+
+The state alone cannot tell those apart, so a `next(state, event)` signature pushes the
+guard out into the callback-lookup code, where the exhaustive property test cannot reach
+it — a test that passes while the hazard lives elsewhere. `checkoutRequestId === null`
+puts it back inside the function. An unidentified charge is therefore resolvable only by
+`manual_resolve`, which is the intended guarantee.
 
 ## Property tests to write first (Weekend 1)
 
-1. For every state `s` in `{settled, failed}` and every event `e`: `next(s, e) === null`.
-2. For any event sequence, rank never decreases, with rank: `pending`=0, `push_unknown`=`awaiting_callback`=1, `unresolved`=2, `settled`/`failed`=3.
-3. `push_unknown` is never reachable to `settled`/`failed` by any automatic event (only via `unresolved` + callback/manual).
-4. No event sequence from `pending` produces two `push_accepted` effects (the effect "send push" fires only on the `pending` row's first CAS).
+1. For every terminal state and every event, with or without an id: `next(c, e) === null`.
+2. Every transition taken appears in `ALLOWED_EDGES`, an explicit set of legal `from->to`
+   pairs. This replaces the earlier monotonic-rank property, which was unsound:
+   `push_unknown` and `awaiting_callback` are parallel branches rather than successive
+   stages, so no rank orders them, and tying their rank permits illegal sideways moves
+   between the two.
+3. A charge with `checkoutRequestId === null` never reaches `settled`/`failed` by any
+   automatic event. (`pending` is excluded: a definitively refused push goes straight to
+   `failed` and needs no id, because nothing was queued.)
+4. A second `push_accepted` never changes state, from any state and any id.
+5. Safaricom's evidence — `callback`, `query_result`, `query_failed` — cannot move a
+   charge with no id, from any state.
+
+The effect-level property — that no event sequence produces two "send push" effects —
+needs the store's compare-and-set and belongs to Weekend 2.
+
+Each of these must be mutation-checked: deleting the `NEEDS_CHECKOUT_ID` guard has to
+fail tests 3, 5 and the `unresolved` example, or they are decoration.
 
 ## Mapping SDK outcomes to events (the adapter's job, and where bugs will hide)
 
@@ -123,6 +161,12 @@ Note `unresolved` accepts a real callback: if the customer's payment completes l
 Default to `push_ambiguous` for any error class the adapter does not recognise; a wrongly ambiguous charge costs a manual check, a wrongly rejected one can hide a live prompt.
 
 Type normalisation: `parseStkCallback().resultCode` is a number, `status.stkPush().resultCode` is a string. Convert both to number before calling `next()`.
+
+Weekend 3 note: the callback handler looks a charge up by `CheckoutRequestID`, which
+cannot match a `push_unknown` row. When the candidate match on
+`(phone, amount, accountRef)` is added, it must only attach the candidate id to the
+`unresolved` event for a human to read — never feed that charge to `next()` as if the
+payload were proof. The guard makes that safe by construction rather than by discipline.
 
 ## Matrix changes (replace/add rows in section 10)
 
