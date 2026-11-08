@@ -54,6 +54,8 @@ export class FakeDaraja implements Transport {
   readonly queryCalls: string[] = [];
   /** How long 'hang' blocks before the client-side timeout fires. */
   hangMs = 10;
+  /** Latency applied to a successful push, so concurrent callers genuinely overlap. */
+  latencyMs = 0;
   defaultOutcome = 0;
 
   scriptPush(...b: PushBehaviour[]): this {
@@ -84,6 +86,7 @@ export class FakeDaraja implements Transport {
         this.register(req);
         throw new FakeTimeoutError();
       case 'ok': {
+        if (this.latencyMs > 0) await new Promise((res) => setTimeout(res, this.latencyMs));
         const r = this.register(req);
         return { checkoutRequestId: r.checkoutRequestId, merchantRequestId: r.merchantRequestId };
       }

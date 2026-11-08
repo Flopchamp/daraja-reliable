@@ -63,5 +63,12 @@ export interface Store {
   /** Release a lease early. */
   release(id: string): Promise<void>;
 
+  /**
+   * Crash recovery: charges still `pending` since before `before` had their push response
+   * lost (the process died between the intent write and storing the outcome). Moves them
+   * to `push_unknown` in one statement and returns them. Never re-pushes.
+   */
+  markStalePending(before: Date): Promise<Charge[]>;
+
   appendAudit(entry: AuditEntry): Promise<void>;
 }
