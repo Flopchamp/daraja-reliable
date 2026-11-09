@@ -14,6 +14,7 @@ interface Row {
   account_ref: string;
   state: State;
   checkout_request_id: string | null;
+  receipt: string | null;
   attempt: number;
   query_failures: number;
   push_started_at: Date;
@@ -31,6 +32,7 @@ const toCharge = (r: Row): Charge => ({
   accountRef: r.account_ref,
   state: r.state,
   checkoutRequestId: r.checkout_request_id,
+  receipt: r.receipt,
   attempt: r.attempt,
   queryFailures: r.query_failures,
   pushStartedAt: r.push_started_at,
@@ -87,18 +89,19 @@ export class PostgresStore implements Store {
     id: string,
     from: State,
     to: State,
-    patch: { checkoutRequestId?: string; queryFailures?: number } = {},
+    patch: { checkoutRequestId?: string; queryFailures?: number; receipt?: string } = {},
   ): Promise<Charge | null> {
     const r = await this.pool.query<Row>(
       `UPDATE dr_charges
           SET state = $3,
               checkout_request_id = COALESCE($4, checkout_request_id),
               query_failures = COALESCE($5, query_failures),
+              receipt = COALESCE($6, receipt),
               claimed_until = NULL,
               updated_at = now()
         WHERE id = $1 AND state = $2
         RETURNING *`,
-      [id, from, to, patch.checkoutRequestId ?? null, patch.queryFailures ?? null],
+      [id, from, to, patch.checkoutRequestId ?? null, patch.queryFailures ?? null, patch.receipt ?? null],
     );
     return r.rows[0] ? toCharge(r.rows[0]) : null;
   }

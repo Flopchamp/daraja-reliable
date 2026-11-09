@@ -1,5 +1,8 @@
 export { createReliableDaraja, IdempotencyConflictError, ValidationError, fingerprint } from './reliable.js';
-export type { ChargeInput, ChargeResult, Reliable, ReliableOptions } from './reliable.js';
+export type { ChargeInput, ChargeResult, CallbackInput, CallbackResult, CallbackReason, Reliable, ReliableOptions } from './reliable.js';
+export { buildIpMatcher } from './ip.js';
+export { parseStkCallback } from './callback.js';
+export type { ParsedCallback } from './callback.js';
 export { next, TERMINAL, ALLOWED_EDGES, QUERY_FAILURE_LIMIT } from './state.js';
 export type { State, Event, ChargeView } from './state.js';
 export { PostgresStore, migrate } from './pg-store.js';
