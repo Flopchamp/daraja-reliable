@@ -10,6 +10,8 @@ export interface Charge {
   accountRef: string;
   state: State;
   checkoutRequestId: string | null;
+  /** M-Pesa receipt; set only when settled by a callback that carried one. */
+  receipt: string | null;
   attempt: number;
   queryFailures: number;
   pushStartedAt: Date;
@@ -54,7 +56,7 @@ export interface Store {
     id: string,
     from: State,
     to: State,
-    patch?: { checkoutRequestId?: string; queryFailures?: number },
+    patch?: { checkoutRequestId?: string; queryFailures?: number; receipt?: string },
   ): Promise<Charge | null>;
 
   /** Claim up to `limit` overdue charges for `leaseMs`; claimed rows are invisible to other claimers. */

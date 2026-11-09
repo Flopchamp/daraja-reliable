@@ -17,7 +17,7 @@ afterAll(async () => {
   await pool?.end();
 });
 
-const make = (now?: () => Date) => createReliableDaraja({ transport: fake, store, ...(now ? { now } : {}) });
+const make = (now?: () => Date) => createReliableDaraja({ transport: fake, store, trustedSourceIps: 'disabled', ...(now ? { now } : {}) });
 const key = (k = 'invoice-1') => ({ idempotencyKey: k, ...req });
 const rowCount = async () => Number((await pool.query('SELECT count(*) FROM dr_charges')).rows[0].count);
 
