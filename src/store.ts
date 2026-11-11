@@ -51,6 +51,18 @@ export interface Store {
   get(id: string): Promise<Charge | null>;
   getByCheckoutRequestId(checkoutRequestId: string): Promise<Charge | null>;
 
+  /**
+   * Record the CheckoutRequestID, which is IDENTITY rather than state: it is the only
+   * correlation id Safaricom ever issues, it exists solely in the push response, and
+   * without it no callback or query can ever be bound to this charge.
+   *
+   * It is therefore persisted on its own, never as a passenger on a state transition that
+   * might lose a compare-and-set race — losing that race must not be able to discard it.
+   * Idempotent and state-independent: first write wins, later writes are no-ops, and the
+   * current charge comes back either way.
+   */
+  bindCheckoutRequestId(id: string, checkoutRequestId: string): Promise<Charge | null>;
+
   /** Atomically move `id` from `from` to `to`; returns the updated charge or null if state differed. */
   transition(
     id: string,

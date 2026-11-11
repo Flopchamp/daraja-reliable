@@ -80,11 +80,16 @@ describe('state machine properties', () => {
     );
   });
 
-  it('4. a second push_accepted never changes state', () => {
+  it('4. push_accepted is accepted exactly where identity is still outstanding', () => {
     fc.assert(
       fc.property(chargeArb, fc.string({ minLength: 1 }), (c, id) => {
-        if (c.state === 'pending') return true;
-        return next(c, { type: 'push_accepted', checkoutRequestId: id }) === null;
+        const n = next(c, { type: 'push_accepted', checkoutRequestId: id });
+        // `pending` is the normal route. `push_unknown` is the late one: a push response
+        // that arrived after a recovery sweep had already written the charge off. It
+        // carries the CheckoutRequestID, so accepting it adds information.
+        // Everywhere else — including `unresolved`, which a human owns — it is inert.
+        if (c.state === 'pending' || c.state === 'push_unknown') return n === 'awaiting_callback';
+        return n === null;
       }),
     );
   });
@@ -98,7 +103,7 @@ describe('state machine properties', () => {
     );
   });
 
-  it('only pending can be moved by push outcomes', () => {
+  it('only pending can be moved by an ambiguous or rejected push', () => {
     for (const s of states.filter((x) => x !== 'pending')) {
       expect(next(withId(s), { type: 'push_ambiguous' })).toBeNull();
       expect(next(withId(s), { type: 'push_rejected', reason: '' })).toBeNull();
@@ -125,6 +130,17 @@ describe('state machine examples', () => {
   it('a lost push response gives push_unknown, and the deadline only makes it unresolved', () => {
     expect(next(noId('pending'), { type: 'push_ambiguous' })).toBe('push_unknown');
     expect(next(noId('push_unknown'), { type: 'deadline_passed' })).toBe('unresolved');
+  });
+
+  it('a push response arriving after a recovery sweep is recognised, not discarded', () => {
+    // recover() moved the charge to push_unknown while the push was still in flight;
+    // the response then came back carrying the id. Nothing about the payment changed,
+    // only what we know about it, so the charge rejoins the normal path.
+    expect(next(noId('push_unknown'), { type: 'push_accepted', checkoutRequestId: 'ws_CO_1' })).toBe(
+      'awaiting_callback',
+    );
+    // A charge already on a human's desk is not quietly taken back off it.
+    expect(next(noId('unresolved'), { type: 'push_accepted', checkoutRequestId: 'ws_CO_1' })).toBeNull();
   });
 
   it('"processing" query result leaves state alone', () => {

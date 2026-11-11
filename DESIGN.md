@@ -81,7 +81,8 @@ export function next(c: ChargeView, e: Event): State | null {
   if (c.checkoutRequestId === null && NEEDS_CHECKOUT_ID.has(e.type)) return null;
 
   switch (e.type) {
-    case 'push_accepted':  return c.state === 'pending' ? 'awaiting_callback' : null;
+    case 'push_accepted':  return c.state === 'pending' || c.state === 'push_unknown'
+                                  ? 'awaiting_callback' : null;   // see "Identity is not state"
     case 'push_rejected':  return c.state === 'pending' ? 'failed' : null;
     case 'push_ambiguous': return c.state === 'pending' ? 'push_unknown' : null;
 
@@ -125,6 +126,45 @@ it — a test that passes while the hazard lives elsewhere. `checkoutRequestId =
 puts it back inside the function. An unidentified charge is therefore resolvable only by
 `manual_resolve`, which is the intended guarantee.
 
+## Identity is not state (Weekend 2 fix)
+
+Weekend 2's `apply()` read a charge, decided with `next()`, then compare-and-set. On a CAS
+miss it recorded `ignored` and stopped. That is wrong, and it cost money twice:
+
+- **`recover()` sweeping a push still in flight.** The sweep moves the row to
+  `push_unknown`; the push then succeeds; the CAS expecting `pending` misses, and the
+  `CheckoutRequestID` riding in its patch is discarded. The customer has paid, and the
+  callback arrives as `unknown_charge` — unbindable for good.
+- **A callback landing as the reconciler gives up.** `query_failed` moves the row to
+  `unresolved`; the in-flight callback's CAS misses. `next(unresolved, callback)` returns
+  `settled`, so it *was* applicable — but it is thrown away and a person has to resolve a
+  charge Safaricom already confirmed. The two timers are deliberately set to the same
+  window, so this is not an edge case.
+
+One root cause: **a CAS miss means the state moved, not that the event was inapplicable.**
+`next()` was decided against a view that is now stale. Two changes:
+
+1. **Re-read and re-decide on a miss**, bounded by `MAX_CAS_ATTEMPTS`. Exactly-once is
+   preserved by the CAS itself, not by deciding only once — a loser that re-reads a
+   terminal row gets `null` from `next()` and reports `already_terminal`.
+2. **Persist `checkoutRequestId` in its own statement** (`SET checkout_request_id =
+   COALESCE(checkout_request_id, $2) WHERE id = $1`), before the transition is attempted.
+   It is *identity*, not state: the only correlation id Safaricom ever issues, present
+   solely in the push response, and without it no callback can ever bind. It must not be
+   able to die with a lost race. Idempotent, state-independent, first write wins.
+
+`push_unknown->awaiting_callback` becomes a legal edge as a consequence: a push response
+that arrives after the sweep wrote the charge off carries the id, which is strictly more
+information than we had. Learning identity is an upgrade, not a regression. `unresolved`
+is deliberately excluded — a charge on a person's desk is not taken back off it behind
+their back, though its id is still recorded so a later callback can settle it.
+
+Mutation-checked: disabling the retry, the separate identity write, or the new edge each
+fails at least one test. The identity write initially survived, because the retry path
+carries the patch into `transition`'s own `COALESCE`; the surviving mutant was the signal
+for the missing case — a push response arriving once the charge has already reached
+`unresolved`, where no transition is taken to carry the id at all.
+
 ## Property tests to write first (Weekend 1)
 
 1. For every terminal state and every event, with or without an id: `next(c, e) === null`.
@@ -136,7 +176,8 @@ puts it back inside the function. An unidentified charge is therefore resolvable
 3. A charge with `checkoutRequestId === null` never reaches `settled`/`failed` by any
    automatic event. (`pending` is excluded: a definitively refused push goes straight to
    `failed` and needs no id, because nothing was queued.)
-4. A second `push_accepted` never changes state, from any state and any id.
+4. `push_accepted` yields `awaiting_callback` from exactly `pending` and `push_unknown`,
+   and `null` everywhere else — including `unresolved`, which a human owns.
 5. Safaricom's evidence — `callback`, `query_result`, `query_failed` — cannot move a
    charge with no id, from any state.
 
@@ -179,6 +220,10 @@ payload were proof. The guard makes that safe by construction rather than by dis
 | STK query says "still processing" | Stays `awaiting_callback`, attempts++ | unit |
 | Same key, different amount | `IdempotencyConflictError`, no push | unit |
 | Callback arrives for a `push_unknown` charge's real prompt | Payload retained, `unresolved` event carries candidate id, state not auto-settled | integration |
+| `recover()` sweeps a charge whose push is still in flight | Late `push_accepted` keeps its id and rejoins `awaiting_callback`; the callback still settles | integration |
+| Callback's CAS misses because the reconciler moved the row to `unresolved` | Re-decided against the fresh state and applied: `settled`, audited `unresolved->settled` | integration |
+| Push response arrives when the charge is already `unresolved` | State unchanged (a human owns it), but the id is recorded so a later callback settles it | integration |
+| Callback's CAS misses because the row is already terminal | `already_terminal`, `duplicate: true`, and no second transition recorded | integration |
 
 Drop the old row "Transaction Status ..." wording; every occurrence means **STK Push Query**.
 

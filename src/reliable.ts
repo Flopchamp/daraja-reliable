@@ -93,6 +93,12 @@ export interface Reliable {
   /**
    * Crash recovery. A charge left `pending` longer than `olderThanMs` lost its push
    * response; it becomes `push_unknown`. This NEVER re-pushes.
+   *
+   * `olderThanMs` MUST exceed your transport's total timeout, retries included. A charge
+   * is `pending` for as long as the push is in flight, so a window shorter than that
+   * sweeps up live requests and churns healthy charges into `push_unknown`. That is no
+   * longer destructive — a late push response is now recognised and its id retained —
+   * but it is pointless work. Minutes, not seconds.
    */
   recover(opts: { olderThanMs: number }): Promise<Charge[]>;
 }
@@ -123,6 +129,9 @@ function isReceiptCollision(err: unknown): boolean {
   return e?.code === '23505' && (e.constraint === 'dr_charges_receipt_uq' || /receipt/.test(e.message ?? ''));
 }
 
+/** How many times apply() will re-read and re-decide after losing a compare-and-set. */
+const MAX_CAS_ATTEMPTS = 3;
+
 export function createReliableDaraja(opts: ReliableOptions): Reliable {
   const { transport, store } = opts;
   const now = opts.now ?? (() => new Date());
@@ -131,34 +140,56 @@ export function createReliableDaraja(opts: ReliableOptions): Reliable {
   /**
    * Run an event through the pure machine, then compare-and-set it into the store.
    * `applied` is true only for the single caller whose CAS won.
+   *
+   * A CAS miss means the state MOVED, not that the event was inapplicable. `next()` was
+   * decided against a view that is now stale, and the very same event is often applicable
+   * to the new state: a callback landing exactly as the reconciler gives up is the common
+   * case, and `next(unresolved, callback)` settles. Treating a miss as "ignore it" throws
+   * away an answer Safaricom will never send again, so a miss re-reads and re-decides.
    */
   async function apply(
-    c: Charge,
+    c0: Charge,
     e: Event,
     patch?: { checkoutRequestId?: string; receipt?: string },
   ): Promise<{ charge: Charge; applied: boolean }> {
-    const to = next(c as ChargeView, e);
-    const ignored = (state: State | null) =>
+    const ignored = (c: Charge) =>
       store.appendAudit({
         chargeId: c.id, checkoutRequestId: c.checkoutRequestId, kind: 'ignored',
-        event: e, fromState: c.state, toState: state, rawPayload: null, at: now(),
+        event: e, fromState: c.state, toState: null, rawPayload: null, at: now(),
       });
 
-    if (to === null) {
-      await ignored(null);
-      return { charge: c, applied: false };
+    // Identity before state. The CheckoutRequestID is written on its own statement, so
+    // that however the transition below turns out, the charge stays bindable to its
+    // callback. A charge that keeps its id is recoverable; one that loses it is not.
+    let c = c0;
+    if (patch?.checkoutRequestId) {
+      c = (await store.bindCheckoutRequestId(c0.id, patch.checkoutRequestId)) ?? c0;
     }
-    const updated = await store.transition(c.id, c.state, to, patch);
-    if (!updated) {
-      // Lost a race: someone else moved it first, and their state is authoritative.
-      await ignored(null);
-      return { charge: (await store.get(c.id)) ?? c, applied: false };
+
+    // Bounded so a pathologically contended row cannot spin here forever.
+    for (let attempt = 1; ; attempt++) {
+      const to = next(c as ChargeView, e);
+      if (to === null) {
+        await ignored(c);
+        return { charge: c, applied: false };
+      }
+
+      const updated = await store.transition(c.id, c.state, to, patch);
+      if (updated) {
+        await store.appendAudit({
+          chargeId: c.id, checkoutRequestId: updated.checkoutRequestId, kind: 'transition',
+          event: e, fromState: c.state, toState: to, rawPayload: null, at: now(),
+        });
+        return { charge: updated, applied: true };
+      }
+
+      const fresh = await store.get(c.id);
+      if (!fresh || attempt >= MAX_CAS_ATTEMPTS) {
+        await ignored(fresh ?? c);
+        return { charge: fresh ?? c, applied: false };
+      }
+      c = fresh;
     }
-    await store.appendAudit({
-      chargeId: c.id, checkoutRequestId: updated.checkoutRequestId, kind: 'transition',
-      event: e, fromState: c.state, toState: to, rawPayload: null, at: now(),
-    });
-    return { charge: updated, applied: true };
   }
 
   return {
@@ -183,8 +214,10 @@ export function createReliableDaraja(opts: ReliableOptions): Reliable {
       // 2. Only the caller that created the row pushes. Map the outcome conservatively:
       //    a definitive refusal fails the charge; anything else may have reached the customer.
       //    The transport call is isolated so that a store error while RECORDING the outcome
-      //    is never mistaken for a transport outcome: it propagates, the row stays `pending`,
-      //    and recover() turns it into push_unknown.
+      //    is never mistaken for a transport outcome: it propagates rather than being read
+      //    as a push failure. Where that leaves the row depends on how far apply() got —
+      //    still `pending`, for recover() to pick up, or already transitioned with only the
+      //    audit write lost. Either way the state is never a lie about the push.
       let outcome: Event;
       let patch: { checkoutRequestId?: string } | undefined;
       try {

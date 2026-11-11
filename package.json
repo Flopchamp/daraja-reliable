@@ -6,6 +6,16 @@
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/fake-daraja.d.ts",
+      "default": "./dist/testing/fake-daraja.js"
+    }
+  },
   "files": [
     "dist",
     "migrations"
@@ -13,9 +23,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --no-file-parallelism",
+    "test": "vitest run --pool=forks --poolOptions.forks.singleFork",
     "test:unit": "vitest run test/unit",
-    "test:integration": "vitest run test/integration --no-file-parallelism"
+    "test:integration": "vitest run test/integration --pool=forks --poolOptions.forks.singleFork"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

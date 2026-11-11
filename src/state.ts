@@ -56,6 +56,7 @@ export const ALLOWED_EDGES: ReadonlySet<string> = new Set<string>([
   'pending->awaiting_callback',
   'pending->failed',
   'pending->push_unknown',
+  'push_unknown->awaiting_callback',
   'awaiting_callback->settled',
   'awaiting_callback->failed',
   'awaiting_callback->unresolved',
@@ -71,7 +72,12 @@ export function next(c: ChargeView, e: Event): State | null {
 
   switch (e.type) {
     case 'push_accepted':
-      return c.state === 'pending' ? 'awaiting_callback' : null;
+      // Also from push_unknown. A push response can arrive after a recovery sweep has
+      // already written the charge off, and it carries the CheckoutRequestID — strictly
+      // MORE information than we had. Learning identity is an upgrade, not a regression.
+      // Deliberately NOT from unresolved: that is a human's queue, and a charge placed
+      // there must not be emptied out of it by a late arrival behind their back.
+      return c.state === 'pending' || c.state === 'push_unknown' ? 'awaiting_callback' : null;
     case 'push_rejected':
       return c.state === 'pending' ? 'failed' : null;
     case 'push_ambiguous':

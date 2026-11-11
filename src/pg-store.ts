@@ -85,6 +85,21 @@ export class PostgresStore implements Store {
     return r.rows[0] ? toCharge(r.rows[0]) : null;
   }
 
+  async bindCheckoutRequestId(id: string, checkoutRequestId: string): Promise<Charge | null> {
+    // COALESCE, not a plain assignment: one statement that is idempotent, never overwrites
+    // an id already on the row, and returns the row whether or not it changed. No state
+    // predicate, because identity is not state.
+    const r = await this.pool.query<Row>(
+      `UPDATE dr_charges
+          SET checkout_request_id = COALESCE(checkout_request_id, $2),
+              updated_at = now()
+        WHERE id = $1
+        RETURNING *`,
+      [id, checkoutRequestId],
+    );
+    return r.rows[0] ? toCharge(r.rows[0]) : null;
+  }
+
   async transition(
     id: string,
     from: State,
