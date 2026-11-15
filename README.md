@@ -27,12 +27,15 @@ outcome is genuinely unknowable ends up in front of a person instead of being gu
 | Callback handling, replay protection, origin allowlist | built, tested |
 | Postgres store with compare-and-set transitions and leases | built, tested |
 | Transports: raw `fetch`, `@kepas/daraja-js` adapter | built, tested |
-| **The reconciler sweep loop** | **not built.** `claimOverdue()` and `stkQuery()` exist and are tested; the loop that drives them does not. Charges stuck in `awaiting_callback` are not yet resolved automatically. |
+| Reconciler sweep (`reconcile()`): resolves charges whose callback never arrived | built, tested |
+| Transactional outbox and at-least-once event delivery (`on()` / `dispatch()`) | built, tested |
 | `chargeAgain()` for a deliberate re-push | not built |
 
-93 tests, property tests under [fast-check](https://github.com/dubzzz/fast-check), and the
+115 tests, property tests under [fast-check](https://github.com/dubzzz/fast-check), and the
 state machine is mutation-checked — deleting a guard has to fail a named test or the test
-is decoration. Integration tests run against a real Postgres, because row locking is the
+is decoration. The reconciler and outbox are checked with [Stryker](https://stryker-mutator.io)
+(`npx stryker run`, needs `DATABASE_URL`): 90.5% mutation score over that code, with the
+survivors listed in [DESIGN.md](DESIGN.md) and each one explained. Integration tests run against a real Postgres, because row locking is the
 thing under test and a mock would prove nothing.
 
 ## Install
@@ -50,7 +53,7 @@ import pg from 'pg';
 import { createReliableDaraja, PostgresStore, migrate, fetchAdapter } from 'daraja-reliable';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
-await migrate(pool); // creates dr_charges and dr_audit; idempotent
+await migrate(pool); // creates dr_charges, dr_audit and dr_outbox; idempotent
 
 const pesa = createReliableDaraja({
   store: new PostgresStore(pool),
@@ -127,6 +130,61 @@ A process that dies between writing the intent and recording the push outcome le
 // a charge is `pending` for as long as its push is in flight. Minutes, not seconds.
 const stranded = await pesa.recover({ olderThanMs: 5 * 60_000 });
 ```
+
+### Reconciliation
+
+Safaricom never retries a callback, so a charge whose callback was lost sits in
+`awaiting_callback` forever unless something asks. `reconcile()` asks. Run it on a schedule.
+
+```ts
+// Every minute or so. Safe to run from several processes at once: each overdue charge is
+// leased to one sweeper, so two reconcilers never resolve the same charge twice.
+const r = await pesa.reconcile({ limit: 100, concurrency: 5 });
+// { checked, settled, failed, unresolved, stillWaiting, discrepancies, errors }
+```
+
+For every charge past `callbackDeadlineMs` (default 4 minutes) it calls STK Push Query:
+
+- A definite answer settles or fails the charge, through the same compare-and-set a callback
+  uses, so a callback and a sweep racing each other still produce one transition.
+- "Still processing" leaves it alone.
+- A query that errors is not held against the charge until it is older than
+  `callbackDeadlineMs + failureGraceMs`. After three such failures it becomes `unresolved`.
+- A `push_unknown` charge has nothing to query, so it goes straight to `unresolved` for a
+  person. It is never guessed at.
+- If the query contradicts a callback that already settled the charge, nothing is
+  overwritten. A `discrepancy` event is raised so a person looks.
+
+### Events
+
+Every outcome that needs something to happen next — fulfil an order, refund, page a human —
+is written to an outbox **in the same SQL statement as the transition**. The event exists if
+and only if the transition committed; there is no window where the charge moved and the
+event was lost, or the event exists for a move that rolled back.
+
+```ts
+pesa.on('settled', async (charge, meta) => {
+  // meta: { type, detail, attempt }. attempt is 1 on first delivery, 2+ on redelivery.
+  await fulfilOrder(charge);
+});
+pesa.on('unresolved', async (charge) => pageSomeone(charge));
+pesa.on('discrepancy', async (charge, meta) => pageSomeone(charge, meta.detail));
+
+await pesa.dispatch(); // also runs at the end of every reconcile()
+```
+
+Event types: `settled`, `failed`, `unresolved`, `discrepancy`.
+
+Delivery is **at-least-once**. A handler that throws keeps its event, and it is redelivered
+after `redeliveryDelayMs` (default 30 s) with `attempt` incremented. So a handler can run
+twice for one event and **must be idempotent** — key your fulfilment on `charge.id`. If no
+handler is registered for a type, its events stay queued rather than being consumed, so a
+process that starts later still delivers them. Concurrent dispatchers deliver each event to
+one claimer at a time.
+
+`applied` from `handleCallback` is still the quickest way to fulfil from the callback route.
+The outbox is what covers the cases it cannot: outcomes reached by the reconciler, and
+processes that crash between the callback and the fulfilment.
 
 ## The state machine
 
@@ -215,8 +273,10 @@ npm test              # unit + integration
 npm run test:unit     # no database needed
 ```
 
-Integration tests truncate `dr_charges` and `dr_audit` between cases, so point
-`DATABASE_URL` at a throwaway database.
+Integration tests truncate `dr_charges` and `dr_audit` (and the outbox, by cascade) between
+cases, so point `DATABASE_URL` at a throwaway database. Run them through `npm test`, which
+serialises the files: they share one database and would truncate each other's rows if run
+in parallel.
 
 ## Scope
 

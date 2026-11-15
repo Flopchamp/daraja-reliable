@@ -165,6 +165,129 @@ carries the patch into `transition`'s own `COALESCE`; the surviving mutant was t
 for the missing case — a push response arriving once the charge has already reached
 `unresolved`, where no transition is taken to carry the id at all.
 
+## Reconciler and outbox (Weekend 4)
+
+Two pieces, built together because the reconciler is useless without somewhere to put what
+it finds.
+
+### The outbox: an event exists iff its transition committed
+
+Fulfilment must happen once per outcome, but "the charge moved" and "tell the application"
+are two writes, and any gap between them loses or invents events. `PostgresStore.transition`
+therefore does both in **one statement**: a data-modifying CTE updates the charge, and a
+second CTE inserts into `dr_outbox` from the rows the first returned.
+
+- A data-modifying CTE always runs to completion even though the outer `SELECT` never
+  references it, so the insert cannot be skipped.
+- When the compare-and-set matches no row, the update returns nothing and so the insert
+  selects nothing. A losing writer writes no event. Twenty callbacks that all read stale
+  state produce exactly one `settled` event, and that is tested.
+- Only `settled`, `failed` and `unresolved` are announced, and only when the state actually
+  changed (`state <> $2`). Moves like `pending -> awaiting_callback` write none.
+- `discrepancy` is the exception: it is not a transition, so it goes through
+  `appendOutbox` — raised when two sources of truth disagree about a charge that is already
+  terminal (a callback vs. the recorded state, or a reconciler query vs. a callback).
+  Forward-only means we never overwrite; we say so instead.
+
+### Delivery is at-least-once, on purpose
+
+`dispatch()` claims events with `FOR UPDATE SKIP LOCKED` and a lease (`claimed_until`), runs
+the handlers, then sets `delivered_at`. A handler that throws has its event kept and its
+lease pushed out by `redeliveryDelayMs`, so redelivery reuses the same column rather than
+adding a retry table. `attempts` is incremented on claim and handed to the handler as
+`attempt`.
+
+Exactly-once delivery to arbitrary application code is not available: the handler's side
+effect and `delivered_at` cannot share a transaction. So the contract is stated rather than
+hidden — handlers must be idempotent, keyed on `charge.id`.
+
+Decisions that look arbitrary and are not:
+
+- **No listener, no claim.** `dispatch()` only claims types that have a handler. Claiming
+  an event nobody can handle would burn an attempt and delay it; leaving it untouched means
+  a process that registers its handler later still receives it.
+- **Reconcile ends by dispatching, and ignores dispatch failures.** Delivery trouble must
+  not mask a sweep that finished and mutated state.
+- **Per-batch lease, not per-sweep.** `reconcile()` claims `min(concurrency, remaining)`
+  charges at a time, so a lease covers one batch (about one transport timeout) rather than
+  the whole sweep. A charge still in flight keeps its lease, which is also what stops the
+  loop re-claiming it forever.
+- **An unknown charge is not silently dropped.** If an outbox row's charge no longer exists,
+  that is a delivery failure like any other: the event stays and is retried.
+
+### What the reconciler does with each answer
+
+| Situation | Result |
+|---|---|
+| `push_unknown` past the deadline | `unresolved`. No id, nothing to query, never guessed |
+| Query says `processing` | Leave it. Reset the failure streak, since we got an answer |
+| Query gives a result code | Same compare-and-set as a callback: `settled` or `failed` |
+| Query throws, charge younger than `deadline + grace` | Not counted. A query made while the prompt is live can look like an outage |
+| Query throws, older than that | `queryFailures++`; the third failure moves it to `unresolved` |
+| Lost the CAS and the row is terminal, answers disagree | `discrepancy` event, no overwrite |
+| Lost the CAS and the row is terminal, answers agree | Nothing: a callback got there first |
+
+The age rule is the mitigation the table at the top flagged: whether an in-flight query
+surfaces as a 5xx is still unverified against the sandbox, so failures are only held against
+a charge once its callback is long overdue.
+
+### Known limits
+
+- A handler that runs longer than `leaseMs` can be redelivered while it is still running.
+  Keep handlers short or make them hand off to a queue.
+- Order is preserved within one claimed batch, not across dispatchers or across redeliveries.
+- `chargeAgain()` is still not built.
+
+### How this was checked
+
+32 tests cover the sweep, the outbox invariant, and delivery, including two reconcilers and
+two dispatchers racing on one database. Before adding a mutation tool I broke the
+reconciler and outbox by hand seven ways; each was caught by a test.
+
+Then Stryker, scoped to only the Weekend 4 lines (`stryker.config.json`), one mutant at a
+time because the tests share a database. First run: **80.0%** (167 killed, 36 survived, 6
+uncovered). The survivors were real gaps, not noise, and 10 tests were added for them:
+
+- a recorded *failure* contradicted by a successful query raised no discrepancy (only the
+  reverse direction was tested);
+- an identical duplicate callback was never asserted to raise **no** discrepancy, so a
+  mutant that flagged every duplicate passed;
+- the `not_applicable` callback result had no coverage at all;
+- the exact `deadline + grace` boundary, the per-outcome counters, the `limit` cap when
+  `concurrency` is larger, the `receipt_already_used` payload, and unsubscribing one of two
+  handlers.
+
+Second run: **90.5%** (189 killed, 1 timeout, 17 survived, 3 uncovered; `reliable.ts` 94.9%,
+`pg-store.ts` 67.7%). One more assertion was added afterwards (that `transition()` persists
+its `checkoutRequestId` patch); the run was not repeated after it, so the score above does
+not include it. The remaining survivors, and why they are left:
+
+| Survivors | Why they survive |
+|---|---|
+| `claimOutbox` `.sort()` (7, `pg-store.ts`) | Postgres does return `UPDATE ... RETURNING` rows in id order in practice, so no test can observe the sort. It stays as a guard for a guarantee SQL does not give. |
+| `types.length === 0` guards (3) | Duplicated in `dispatch()` and `claimOutbox`, and `ANY('{}')` matches nothing anyway. Defence in depth, not a gap. |
+| `failures < QUERY_FAILURE_LIMIT` (2) | `next()` enforces the same limit, so the early return is a shortcut. |
+| `queryFailures > 0` → `>= 0` or `true` (2) | Only adds a harmless extra write of 0. |
+| `if (l)` in unsubscribe (1) | `l` is always defined there; the mutant behaves identically. |
+| `payload === undefined` (1) | pg turns an `undefined` parameter into NULL. |
+| `handlers.get(e.type) ?? []` (1, uncovered) | `dispatch()` only claims types that have a handler, so the fallback is unreachable. |
+| `transition()` patch persistence (1, `checkoutRequestId`) | Real gap, closed by the assertion added after this run. |
+| Charge missing when delivering (2 incl. uncovered) | An outbox row cannot outlive its charge under the foreign key, so there is no way to reach it from a test. |
+
+A mutation score is a measure of the tests, not a proof of the code. It says these tests
+notice most one-line breakages in this code, and the table says which they do not.
+
+**Test-environment note.** The tests compare the host clock with the database's own `now()`
+and allow only about one second between them. A database in a VM whose clock has drifted
+(this happened after a WSL restart) fails the sweep tests with `checked: 0`, which looks
+like a code bug and is not. Sync the database host's clock before trusting such a failure.
+
+Harness bug found on the way: `freshDb()` ran in every `beforeEach` and opened a new pool of
+20 connections each time, closing only the last. Against a Postgres with `max_connections =
+100` the suite failed partway with "remaining connection slots are reserved". It now reuses
+one pool per file. This probably also explains the single unexplained worker crash seen in
+the first run of the new tests, though that was not reproduced to confirm.
+
 ## Property tests to write first (Weekend 1)
 
 1. For every terminal state and every event, with or without an id: `next(c, e) === null`.
