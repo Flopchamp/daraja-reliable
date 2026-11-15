@@ -39,6 +39,11 @@ function racing(real: Store, hook: () => Promise<unknown>): Store {
     release: (id) => real.release(id),
     markStalePending: (d) => real.markStalePending(d),
     appendAudit: (e) => real.appendAudit(e),
+    setQueryFailures: (id, n) => real.setQueryFailures(id, n),
+    appendOutbox: (e) => real.appendOutbox(e),
+    claimOutbox: (o) => real.claimOutbox(o),
+    markDelivered: (id, at) => real.markDelivered(id, at),
+    markDeliveryFailed: (id, at) => real.markDeliveryFailed(id, at),
     async transition(id, from, to, patch) {
       if (!fired) {
         fired = true;
