@@ -1,0 +1,17 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "testRunner": "vitest",
+  "coverageAnalysis": "perTest",
+  "concurrency": 1,
+  "timeoutMS": 30000,
+  "mutate": [
+    "src/reliable.ts:204-289",
+    "src/reliable.ts:433-458",
+    "src/reliable.ts:461-500",
+    "src/pg-store.ts:109-133",
+    "src/pg-store.ts:139-179"
+  ],
+  "reporters": ["clear-text", "progress", "html"],
+  "htmlReporter": { "fileName": "reports/mutation/index.html" },
+  "tempDirName": ".stryker-tmp"
+}
