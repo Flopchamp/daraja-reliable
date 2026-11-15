@@ -56,6 +56,13 @@ export class FakeDaraja implements Transport {
   hangMs = 10;
   /** Latency applied to a successful push, so concurrent callers genuinely overlap. */
   latencyMs = 0;
+  /** Latency applied to every stkQuery, so concurrent reconcilers genuinely overlap. */
+  queryLatencyMs = 0;
+  /**
+   * Runs at the start of every stkQuery, before it answers. Lets a test land a callback or
+   * a second reconciler in the exact window between "claimed the row" and "applied the answer".
+   */
+  beforeQuery: ((checkoutRequestId: string) => Promise<void>) | undefined = undefined;
   defaultOutcome = 0;
 
   scriptPush(...b: PushBehaviour[]): this {
@@ -95,6 +102,8 @@ export class FakeDaraja implements Transport {
 
   async stkQuery(checkoutRequestId: string): Promise<StkQueryResponse> {
     this.queryCalls.push(checkoutRequestId);
+    if (this.queryLatencyMs > 0) await new Promise((res) => setTimeout(res, this.queryLatencyMs));
+    if (this.beforeQuery) await this.beforeQuery(checkoutRequestId);
     const scripted = this.queryScript.get(checkoutRequestId)?.shift();
     if (scripted) {
       if (scripted.kind === 'error') throw new FakeHttpError(500);
