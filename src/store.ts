@@ -41,6 +41,23 @@ export interface AuditEntry {
 }
 
 /**
+ * What the application is told about. `settled`, `failed` and `unresolved` are written by the
+ * store itself, atomically with the transition that causes them. `discrepancy` means Safaricom's
+ * evidence contradicts a charge already recorded as terminal; nothing changed, a person should look.
+ */
+export type OutboxType = 'settled' | 'failed' | 'unresolved' | 'discrepancy';
+
+export interface OutboxEntry {
+  /** bigserial, so a string: it can exceed Number.MAX_SAFE_INTEGER in principle. */
+  id: string;
+  chargeId: string;
+  type: OutboxType;
+  payload: unknown;
+  /** Delivery attempts so far, including the one this claim represents. */
+  attempts: number;
+}
+
+/**
  * Persistence contract. Every state change is a compare-and-set on (id, expected state):
  * the implementation MUST be a single atomic statement, never read-then-write.
  */
@@ -63,7 +80,13 @@ export interface Store {
    */
   bindCheckoutRequestId(id: string, checkoutRequestId: string): Promise<Charge | null>;
 
-  /** Atomically move `id` from `from` to `to`; returns the updated charge or null if state differed. */
+  /**
+   * Atomically move `id` from `from` to `to`; returns the updated charge or null if state differed.
+   *
+   * When `to` is settled, failed or unresolved the matching outbox row MUST be inserted by the
+   * same atomic statement: the event exists if and only if the transition committed. A compare-
+   * and-set that loses writes no event, which is what makes delivery exactly-once per transition.
+   */
   transition(
     id: string,
     from: State,
@@ -84,5 +107,27 @@ export interface Store {
    */
   markStalePending(before: Date): Promise<Charge[]>;
 
+  /**
+   * Record a consecutive query-failure count WITHOUT changing state and WITHOUT releasing the
+   * lease, so the lease keeps acting as backoff until it expires.
+   */
+  setQueryFailures(id: string, count: number): Promise<void>;
+
   appendAudit(entry: AuditEntry): Promise<void>;
+
+  /** Append an event that no transition produces (a `discrepancy`). */
+  appendOutbox(e: { chargeId: string; type: OutboxType; payload: unknown }): Promise<void>;
+
+  /**
+   * Claim up to `limit` undelivered events of the given types for `leaseMs`, oldest first. A
+   * claimed row is invisible to other claimers until the lease expires, and each claim counts
+   * as an attempt. Only the requested types are claimed, so an event nobody listens for stays
+   * queued instead of being consumed and lost.
+   */
+  claimOutbox(opts: { types: readonly OutboxType[]; limit: number; leaseMs: number; now: Date }): Promise<OutboxEntry[]>;
+
+  markDelivered(id: string, at: Date): Promise<void>;
+
+  /** Delivery failed: keep the event, and make it claimable again at `retryAt`. */
+  markDeliveryFailed(id: string, retryAt: Date): Promise<void>;
 }
