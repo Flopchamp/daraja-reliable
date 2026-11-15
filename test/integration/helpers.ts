@@ -12,8 +12,13 @@ export function databaseUrl(): string {
   return url;
 }
 
+// One pool per test file. freshDb() runs in every beforeEach; opening a new
+// 20-connection pool each time leaked connections until Postgres refused more.
+let shared: pg.Pool | undefined;
+
 export async function freshDb(): Promise<{ pool: pg.Pool; store: PostgresStore }> {
-  const pool = new pg.Pool({ connectionString: databaseUrl(), max: 20 });
+  if (shared?.ended) shared = undefined;
+  const pool = (shared ??= new pg.Pool({ connectionString: databaseUrl(), max: 20 }));
   await migrate(pool);
   await pool.query('TRUNCATE dr_audit, dr_charges RESTART IDENTITY CASCADE');
   return { pool, store: new PostgresStore(pool) };
