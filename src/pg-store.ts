@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import type { Pool } from 'pg';
 import type { State } from './state.js';
-import type { AuditEntry, Charge, NewCharge, Store } from './store.js';
+import type { AuditEntry, Charge, NewCharge, OutboxEntry, OutboxType, Store } from './store.js';
 
 interface Row {
   id: string;
@@ -106,19 +106,76 @@ export class PostgresStore implements Store {
     to: State,
     patch: { checkoutRequestId?: string; queryFailures?: number; receipt?: string } = {},
   ): Promise<Charge | null> {
+    // One statement, so the event exists iff the transition committed. A data-modifying CTE
+    // always runs to completion even though the outer SELECT does not reference it; and when
+    // the compare-and-set matches no row, `upd` is empty and so no event is written.
     const r = await this.pool.query<Row>(
-      `UPDATE dr_charges
-          SET state = $3,
-              checkout_request_id = COALESCE($4, checkout_request_id),
-              query_failures = COALESCE($5, query_failures),
-              receipt = COALESCE($6, receipt),
-              claimed_until = NULL,
-              updated_at = now()
-        WHERE id = $1 AND state = $2
-        RETURNING *`,
+      `WITH upd AS (
+         UPDATE dr_charges
+            SET state = $3,
+                checkout_request_id = COALESCE($4, checkout_request_id),
+                query_failures = COALESCE($5, query_failures),
+                receipt = COALESCE($6, receipt),
+                claimed_until = NULL,
+                updated_at = now()
+          WHERE id = $1 AND state = $2
+          RETURNING *
+       ), ob AS (
+         INSERT INTO dr_outbox (charge_id, type)
+         SELECT id, state FROM upd
+          WHERE state IN ('settled','failed','unresolved') AND state <> $2::text
+         RETURNING 1
+       )
+       SELECT * FROM upd`,
       [id, from, to, patch.checkoutRequestId ?? null, patch.queryFailures ?? null, patch.receipt ?? null],
     );
     return r.rows[0] ? toCharge(r.rows[0]) : null;
+  }
+
+  async setQueryFailures(id: string, count: number): Promise<void> {
+    await this.pool.query('UPDATE dr_charges SET query_failures = $2, updated_at = now() WHERE id = $1', [id, count]);
+  }
+
+  async appendOutbox(e: { chargeId: string; type: OutboxType; payload: unknown }): Promise<void> {
+    await this.pool.query('INSERT INTO dr_outbox (charge_id, type, payload) VALUES ($1, $2, $3)', [
+      e.chargeId,
+      e.type,
+      e.payload === undefined ? null : JSON.stringify(e.payload),
+    ]);
+  }
+
+  async claimOutbox(opts: {
+    types: readonly OutboxType[];
+    limit: number;
+    leaseMs: number;
+    now: Date;
+  }): Promise<OutboxEntry[]> {
+    if (opts.types.length === 0) return [];
+    const leaseUntil = new Date(opts.now.getTime() + opts.leaseMs);
+    const r = await this.pool.query<{ id: string; charge_id: string; type: OutboxType; payload: unknown; attempts: number }>(
+      `UPDATE dr_outbox SET claimed_until = $4, attempts = attempts + 1
+        WHERE id IN (
+          SELECT id FROM dr_outbox
+           WHERE delivered_at IS NULL
+             AND type = ANY($1::text[])
+             AND (claimed_until IS NULL OR claimed_until < $3)
+           ORDER BY id
+           LIMIT $2
+           FOR UPDATE SKIP LOCKED)
+        RETURNING id, charge_id, type, payload, attempts`,
+      [opts.types, opts.limit, opts.now, leaseUntil],
+    );
+    return r.rows
+      .map((x) => ({ id: x.id, chargeId: x.charge_id, type: x.type, payload: x.payload, attempts: x.attempts }))
+      .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+  }
+
+  async markDelivered(id: string, at: Date): Promise<void> {
+    await this.pool.query('UPDATE dr_outbox SET delivered_at = $2, claimed_until = NULL WHERE id = $1', [id, at]);
+  }
+
+  async markDeliveryFailed(id: string, retryAt: Date): Promise<void> {
+    await this.pool.query('UPDATE dr_outbox SET claimed_until = $2 WHERE id = $1', [id, retryAt]);
   }
 
   async claimOverdue(opts: { before: Date; limit: number; leaseMs: number; now: Date }): Promise<Charge[]> {

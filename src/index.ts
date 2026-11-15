@@ -1,12 +1,12 @@
 export { createReliableDaraja, IdempotencyConflictError, ValidationError, fingerprint } from './reliable.js';
-export type { ChargeInput, ChargeResult, CallbackInput, CallbackResult, CallbackReason, Reliable, ReliableOptions } from './reliable.js';
+export type { ChargeInput, ChargeResult, CallbackInput, CallbackResult, CallbackReason, Reliable, ReliableOptions, ReconcileResult, DispatchResult, EventHandler, EventMeta } from './reliable.js';
 export { buildIpMatcher } from './ip.js';
 export { parseStkCallback } from './callback.js';
 export type { ParsedCallback } from './callback.js';
 export { next, TERMINAL, ALLOWED_EDGES, QUERY_FAILURE_LIMIT } from './state.js';
 export type { State, Event, ChargeView } from './state.js';
 export { PostgresStore, migrate } from './pg-store.js';
-export type { Store, Charge, NewCharge, AuditEntry } from './store.js';
+export type { Store, Charge, NewCharge, AuditEntry, OutboxEntry, OutboxType } from './store.js';
 export { PushRejectedError } from './transport.js';
 export type { Transport, StkPushRequest, StkPushResponse, StkQueryResponse } from './transport.js';
 export { kepasAdapter } from './adapters/kepas.js';
