@@ -147,8 +147,9 @@ describe('PostgresStore: atomic transitions and leases', () => {
       const { charge } = await store.insertIntent({ idempotencyKey: `c${i}`, fingerprint: 'f', ...req });
       await store.transition(charge.id, 'pending', 'awaiting_callback', { checkoutRequestId: `ws_${i}` });
     }
-    const now = new Date(Date.now() + 10_000);
-    const opts = { before: new Date(Date.now() + 5_000), limit: 100, leaseMs: 60_000, now };
+    // Rows are stamped by the database's clock; keep `before` well past any clock disagreement.
+    const now = new Date(Date.now() + 120_000);
+    const opts = { before: new Date(Date.now() + 60_000), limit: 100, leaseMs: 60_000, now };
     const [a, b] = await Promise.all([store.claimOverdue(opts), store.claimOverdue(opts)]);
 
     const ids = [...a, ...b].map((c) => c.id);
@@ -164,7 +165,7 @@ describe('PostgresStore: atomic transitions and leases', () => {
     const { charge } = await store.insertIntent({ idempotencyKey: 'done', fingerprint: 'f', ...req });
     await store.transition(charge.id, 'pending', 'awaiting_callback', { checkoutRequestId: 'X' });
     await store.transition(charge.id, 'awaiting_callback', 'settled');
-    const now = new Date(Date.now() + 10_000);
+    const now = new Date(Date.now() + 120_000);
     expect(await store.claimOverdue({ before: now, limit: 10, leaseMs: 1000, now })).toHaveLength(0);
   });
 });

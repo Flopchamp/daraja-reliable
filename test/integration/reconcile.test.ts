@@ -8,6 +8,13 @@ import { freshDb, req } from './helpers.js';
 
 const DEADLINE = 240_000; // the default callbackDeadlineMs
 const LEASE = 60_000; // the default leaseMs
+// `push_started_at` is stamped by the DATABASE's clock, but virtual time is built on this
+// process's clock. If the two disagree (a Postgres in a VM that drifted, say) a charge is not
+// yet overdue and a sweep sees nothing. This margin must exceed any plausible disagreement;
+// it is far below the 240 s grace window, so no test that needs "not yet aged" is affected.
+const CLOCK_SKEW_MARGIN = 15_000;
+const PAST_DEADLINE = DEADLINE + CLOCK_SKEW_MARGIN; // overdue, but younger than deadline + grace
+const PAST_GRACE = 2 * DEADLINE + CLOCK_SKEW_MARGIN; // old enough for failed queries to count
 const SAFARICOM = '196.201.214.200';
 
 let pool: pg.Pool;
@@ -42,7 +49,7 @@ describe('reconcile(): resolving a callback that never arrived', () => {
     expect(await pesa.reconcile()).toMatchObject({ checked: 0 }); // not overdue: not even queried
     expect(fake.queryCalls).toHaveLength(0);
 
-    advance(DEADLINE + 1000);
+    advance(PAST_DEADLINE);
     const r = await pesa.reconcile();
     expect(r).toMatchObject({ checked: 1, settled: 1, failed: 0, unresolved: 0, errors: 0 });
     expect(await stateOf(c.id)).toBe('settled');
@@ -55,7 +62,7 @@ describe('reconcile(): resolving a callback that never arrived', () => {
     const pesa = make();
     const c = await charge(pesa);
     fake.scriptQuery(c.checkoutRequestId!, { kind: 'done', resultCode: 1032 });
-    advance(DEADLINE + 1000);
+    advance(PAST_DEADLINE);
     expect(await pesa.reconcile()).toMatchObject({ failed: 1, settled: 0 });
     expect(await stateOf(c.id)).toBe('failed');
   });
@@ -64,7 +71,7 @@ describe('reconcile(): resolving a callback that never arrived', () => {
     const pesa = make();
     const c = await charge(pesa);
     fake.scriptQuery(c.checkoutRequestId!, { kind: 'processing' });
-    advance(DEADLINE + 1000);
+    advance(PAST_DEADLINE);
 
     expect(await pesa.reconcile()).toMatchObject({ checked: 1, stillWaiting: 1 });
     expect(await stateOf(c.id)).toBe('awaiting_callback');
@@ -80,7 +87,7 @@ describe('reconcile(): resolving a callback that never arrived', () => {
   it('only charges past their deadline are touched', async () => {
     const pesa = make();
     const old = await charge(pesa, 'old');
-    advance(DEADLINE + 1000);
+    advance(PAST_DEADLINE);
     const fresh = await charge(pesa, 'fresh'); // pushed "now", in virtual time
     // `push_started_at` is stamped by the database at real time, so age the first one only.
     await pool.query("UPDATE dr_charges SET push_started_at = now() + interval '10 minutes' WHERE id = $1", [fresh.id]);
@@ -98,7 +105,7 @@ describe('reconcile(): Safaricom cannot say', () => {
     const pesa = make();
     const c = await charge(pesa);
     errorsFor(c.checkoutRequestId!, 3);
-    advance(DEADLINE + 1000); // past the deadline, but younger than deadline + grace
+    advance(PAST_DEADLINE); // past the deadline, but younger than deadline + grace
 
     for (let i = 0; i < 3; i++) {
       expect(await pesa.reconcile()).toMatchObject({ stillWaiting: 1, unresolved: 0 });
@@ -113,7 +120,7 @@ describe('reconcile(): Safaricom cannot say', () => {
     const pesa = make();
     const c = await charge(pesa);
     errorsFor(c.checkoutRequestId!, 3);
-    advance(2 * DEADLINE + 1000);
+    advance(PAST_GRACE);
 
     const counts: number[] = [];
     for (let i = 0; i < 3; i++) {
@@ -130,7 +137,7 @@ describe('reconcile(): Safaricom cannot say', () => {
     const pesa = make();
     const c = await charge(pesa);
     fake.scriptQuery(c.checkoutRequestId!, { kind: 'error' }, { kind: 'error' }, { kind: 'processing' }, { kind: 'error' });
-    advance(2 * DEADLINE + 1000);
+    advance(PAST_GRACE);
 
     for (let i = 0; i < 4; i++) {
       await pesa.reconcile();
@@ -144,7 +151,7 @@ describe('reconcile(): Safaricom cannot say', () => {
     const pesa = make();
     const c = await charge(pesa);
     errorsFor(c.checkoutRequestId!, 3);
-    advance(2 * DEADLINE + 1000);
+    advance(PAST_GRACE);
     for (let i = 0; i < 3; i++) {
       await pesa.reconcile();
       advance(LEASE + 1000);
@@ -162,7 +169,7 @@ describe('reconcile(): Safaricom cannot say', () => {
     const c = await charge(pesa);
     expect(c.state).toBe('push_unknown');
 
-    advance(DEADLINE + 1000);
+    advance(PAST_DEADLINE);
     expect(await pesa.reconcile()).toMatchObject({ checked: 1, unresolved: 1 });
     expect(await stateOf(c.id)).toBe('unresolved');
     expect(fake.queryCalls).toHaveLength(0);
@@ -175,7 +182,7 @@ describe('reconcile(): concurrency', () => {
     const pesa = make();
     for (let i = 0; i < 30; i++) await charge(pesa, `c${i}`);
     fake.queryLatencyMs = 25; // hold each query open so the two sweeps genuinely overlap
-    advance(DEADLINE + 1000);
+    advance(PAST_DEADLINE);
 
     const [a, b] = await Promise.all([make().reconcile({ concurrency: 4 }), make().reconcile({ concurrency: 4 })]);
     expect(a.checked + b.checked).toBe(30);
@@ -188,7 +195,7 @@ describe('reconcile(): concurrency', () => {
   it('a sweep honours its limit', async () => {
     const pesa = make();
     for (let i = 0; i < 12; i++) await charge(pesa, `c${i}`);
-    advance(DEADLINE + 1000);
+    advance(PAST_DEADLINE);
     expect(await pesa.reconcile({ limit: 5, concurrency: 2 })).toMatchObject({ checked: 5, settled: 5 });
     expect(await pesa.reconcile({ limit: 100 })).toMatchObject({ checked: 7, settled: 7 });
   });
@@ -197,7 +204,7 @@ describe('reconcile(): concurrency', () => {
     const pesa = make();
     const bad = await charge(pesa, 'bad');
     const good = await charge(pesa, 'good');
-    advance(DEADLINE + 1000);
+    advance(PAST_DEADLINE);
 
     const flaky = Object.assign(Object.create(store), {
       transition: (id: string, ...rest: unknown[]) =>
@@ -221,7 +228,7 @@ describe('reconcile(): racing a callback', () => {
     fake.beforeQuery = async (id) => {
       await make().handleCallback({ rawBody: fake.callbackBody(id), sourceIp: SAFARICOM }); // callback says paid
     };
-    advance(DEADLINE + 1000);
+    advance(PAST_DEADLINE);
 
     const r = await pesa.reconcile();
     expect(r).toMatchObject({ discrepancies: 1, settled: 0, failed: 0 });
@@ -238,7 +245,7 @@ describe('reconcile(): racing a callback', () => {
     fake.beforeQuery = async (id) => {
       await make().handleCallback({ rawBody: fake.callbackBody(id), sourceIp: SAFARICOM });
     };
-    advance(DEADLINE + 1000);
+    advance(PAST_DEADLINE);
 
     expect(await pesa.reconcile()).toMatchObject({ discrepancies: 0, settled: 0, stillWaiting: 1 });
     expect(await stateOf(c.id)).toBe('settled');
@@ -269,7 +276,7 @@ describe('reconcile(): boundaries, counters and the other direction of a disagre
     fake.beforeQuery = async (id) => {
       await make().handleCallback({ rawBody: fake.callbackBody(id, { resultCode: 1032 }), sourceIp: SAFARICOM });
     };
-    advance(DEADLINE + 1000); // the query itself answers success by default
+    advance(PAST_DEADLINE); // the query itself answers success by default
 
     expect(await pesa.reconcile()).toMatchObject({ discrepancies: 1, settled: 0, failed: 0 });
     expect(await stateOf(c.id)).toBe('failed');
@@ -297,7 +304,7 @@ describe('reconcile(): boundaries, counters and the other direction of a disagre
     const pesa = make();
     const c = await charge(pesa);
     fake.scriptQuery(c.checkoutRequestId!, { kind: 'error' }, { kind: 'error' }, { kind: 'error' });
-    advance(2 * DEADLINE + 1000);
+    advance(PAST_GRACE);
 
     const seen = [];
     for (let i = 0; i < 3; i++) {
@@ -315,7 +322,7 @@ describe('reconcile(): boundaries, counters and the other direction of a disagre
     fake.beforeQuery = async (id) => {
       await make().handleCallback({ rawBody: fake.callbackBody(id), sourceIp: SAFARICOM });
     };
-    advance(2 * DEADLINE + 1000);
+    advance(PAST_GRACE);
 
     expect(await pesa.reconcile()).toMatchObject({ unresolved: 0, stillWaiting: 1 });
     expect(await stateOf(c.id)).toBe('settled');
@@ -327,7 +334,7 @@ describe('reconcile(): boundaries, counters and the other direction of a disagre
     const pesa = make();
     const c = await charge(pesa);
     expect(c.state).toBe('push_unknown');
-    advance(DEADLINE + 1000);
+    advance(PAST_DEADLINE);
 
     const raced = Object.assign(Object.create(store), {
       claimOverdue: async (o: Parameters<Store['claimOverdue']>[0]) => {
@@ -344,7 +351,7 @@ describe('reconcile(): boundaries, counters and the other direction of a disagre
   it('limit caps the batch even when concurrency is larger', async () => {
     const pesa = make();
     for (let i = 0; i < 12; i++) await charge(pesa, `c${i}`);
-    advance(DEADLINE + 1000);
+    advance(PAST_DEADLINE);
     expect(await pesa.reconcile({ limit: 3, concurrency: 5 })).toMatchObject({ checked: 3, settled: 3 });
     expect(fake.queryCalls).toHaveLength(3);
   });

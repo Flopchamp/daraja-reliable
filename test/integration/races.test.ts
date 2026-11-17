@@ -33,6 +33,7 @@ function racing(real: Store, hook: () => Promise<unknown>): Store {
   return {
     insertIntent: (c) => real.insertIntent(c),
     get: (id) => real.get(id),
+    getByIdempotencyKey: (k) => real.getByIdempotencyKey(k),
     getByCheckoutRequestId: (x) => real.getByCheckoutRequestId(x),
     bindCheckoutRequestId: (id, x) => real.bindCheckoutRequestId(id, x),
     claimOverdue: (o) => real.claimOverdue(o),
@@ -42,6 +43,7 @@ function racing(real: Store, hook: () => Promise<unknown>): Store {
     setQueryFailures: (id, n) => real.setQueryFailures(id, n),
     appendOutbox: (e) => real.appendOutbox(e),
     claimOutbox: (o) => real.claimOutbox(o),
+    settledInChain: (id) => real.settledInChain(id),
     markDelivered: (id, at) => real.markDelivered(id, at),
     markDeliveryFailed: (id, at) => real.markDeliveryFailed(id, at),
     async transition(id, from, to, patch) {
