@@ -12,7 +12,14 @@ export interface Charge {
   checkoutRequestId: string | null;
   /** M-Pesa receipt; set only when settled by a callback that carried one. */
   receipt: string | null;
+  /** 1 for an ordinary charge; each `chargeAgain()` in a chain adds one. */
   attempt: number;
+  /**
+   * The first charge of a retry chain, or null for a charge that was never retried and is not
+   * itself a retry. `rootId ?? id` identifies one logical payment: key fulfilment on that, not
+   * on `id`, or a payment that was prompted twice and paid once could be fulfilled twice.
+   */
+  rootId: string | null;
   queryFailures: number;
   pushStartedAt: Date;
   /** Reconciler lease; null when not claimed. */
@@ -27,12 +34,15 @@ export interface NewCharge {
   phone: string;
   amount: number;
   accountRef: string;
+  /** Set only by `chargeAgain()`. */
+  rootId?: string;
+  attempt?: number;
 }
 
 export interface AuditEntry {
   chargeId: string | null;
   checkoutRequestId: string | null;
-  kind: 'transition' | 'ignored' | 'callback_raw' | 'untrusted_source' | 'malformed';
+  kind: 'transition' | 'ignored' | 'callback_raw' | 'untrusted_source' | 'malformed' | 'retry';
   event: Event | null;
   fromState: State | null;
   toState: State | null;
@@ -66,6 +76,8 @@ export interface Store {
   insertIntent(c: NewCharge): Promise<{ charge: Charge; created: boolean }>;
 
   get(id: string): Promise<Charge | null>;
+  /** Read-only: the charge holding this idempotency key, or null. Never creates anything. */
+  getByIdempotencyKey(key: string): Promise<Charge | null>;
   getByCheckoutRequestId(checkoutRequestId: string): Promise<Charge | null>;
 
   /**
@@ -125,6 +137,13 @@ export interface Store {
    * queued instead of being consumed and lost.
    */
   claimOutbox(opts: { types: readonly OutboxType[]; limit: number; leaseMs: number; now: Date }): Promise<OutboxEntry[]>;
+
+  /**
+   * Other charges of the same retry chain as `id` that are already `settled`. Empty for a charge
+   * that was never retried. Used after a settlement commits, to notice a payment that was
+   * prompted twice and paid twice.
+   */
+  settledInChain(id: string): Promise<Charge[]>;
 
   markDelivered(id: string, at: Date): Promise<void>;
 
