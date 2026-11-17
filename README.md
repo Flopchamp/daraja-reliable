@@ -29,9 +29,9 @@ outcome is genuinely unknowable ends up in front of a person instead of being gu
 | Transports: raw `fetch`, `@kepas/daraja-js` adapter | built, tested |
 | Reconciler sweep (`reconcile()`): resolves charges whose callback never arrived | built, tested |
 | Transactional outbox and at-least-once event delivery (`on()` / `dispatch()`) | built, tested |
-| `chargeAgain()` for a deliberate re-push | not built |
+| `chargeAgain()`: a deliberate re-push after an ambiguous outcome | built, tested |
 
-115 tests, property tests under [fast-check](https://github.com/dubzzz/fast-check), and the
+147 tests, property tests under [fast-check](https://github.com/dubzzz/fast-check), and the
 state machine is mutation-checked — deleting a guard has to fail a named test or the test
 is decoration. The reconciler and outbox are checked with [Stryker](https://stryker-mutator.io)
 (`npx stryker run`, needs `DATABASE_URL`): 90.5% mutation score over that code, with the
@@ -53,7 +53,7 @@ import pg from 'pg';
 import { createReliableDaraja, PostgresStore, migrate, fetchAdapter } from 'daraja-reliable';
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
-await migrate(pool); // creates dr_charges, dr_audit and dr_outbox; idempotent
+await migrate(pool); // creates dr_charges, dr_audit and dr_outbox; idempotent. Run it after upgrading too.
 
 const pesa = createReliableDaraja({
   store: new PostgresStore(pool),
@@ -181,6 +181,44 @@ twice for one event and **must be idempotent** — key your fulfilment on `charg
 handler is registered for a type, its events stay queued rather than being consumed, so a
 process that starts later still delivers them. Concurrent dispatchers deliver each event to
 one claimer at a time.
+
+### Charging again
+
+A charge in `push_unknown` (the response was lost) or `unresolved` (nothing could say) may or may
+not have put a prompt on the customer's phone. The library never re-pushes on its own. When you
+decide a second prompt is better than leaving the customer waiting, you ask for it:
+
+```ts
+const again = await pesa.chargeAgain(charge.id, { acknowledgeDuplicateRisk: true });
+```
+
+The flag has to be the literal `true`, because this is the one call that can take a customer's
+money twice: if the first prompt was live and they pay both, you have both payments.
+
+- **It is a new charge, not a change to the old one.** It has its own row and its own
+  `CheckoutRequestID`, linked by `charge.rootId` (the first charge of the chain; `null` for a
+  charge that was never retried). A late callback for the *old* prompt still binds to the old
+  charge. The old charge is left exactly as it was. If it holds an id, a late callback can still
+  settle it; if it never had one, it stays `push_unknown` / `unresolved`. The library has no
+  public call for resolving a charge by hand yet (the state machine has the edge, the API does
+  not expose it), so that decision lives in your own records for now.
+- **It is idempotent.** Asking again for the same charge returns the same retry with
+  `replayed: true` and never prompts a third time, even when callers race. To retry the retry,
+  call `chargeAgain` on the retry; `attempt` counts them.
+- **It refuses anything else.** `awaiting_callback` has a live prompt the reconciler is already
+  chasing, `pending` may still be in flight, `settled` was paid, and `failed` is a definite
+  answer, so a retry of a refusal is just a new `charge()` of yours. They throw
+  `NotRetryableError` and write nothing.
+- **If both prompts are paid, you are told.** Both charges settle; the second one to do so
+  raises a `discrepancy` event with `reason: 'duplicate_payment'` and the id of the other.
+  Nothing is reversed, because only you can refund.
+
+Because a payment can now be prompted twice, **fulfil on `charge.rootId ?? charge.id`**, not on
+`charge.id`, or one payment that was prompted twice and paid once could be fulfilled twice.
+
+One window cannot be closed: the old charge can settle while the retry's push is on the wire,
+because Safaricom may deliver that callback at any moment. The `duplicate_payment` event is the
+backstop for it.
 
 `applied` from `handleCallback` is still the quickest way to fulfil from the callback route.
 The outbox is what covers the cases it cannot: outcomes reached by the reconciler, and

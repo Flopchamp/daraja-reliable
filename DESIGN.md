@@ -236,7 +236,7 @@ a charge once its callback is long overdue.
 - A handler that runs longer than `leaseMs` can be redelivered while it is still running.
   Keep handlers short or make them hand off to a queue.
 - Order is preserved within one claimed batch, not across dispatchers or across redeliveries.
-- `chargeAgain()` is still not built.
+- `chargeAgain()` was not built in Weekend 4; see the next section.
 
 ### How this was checked
 
@@ -277,16 +277,89 @@ not include it. The remaining survivors, and why they are left:
 A mutation score is a measure of the tests, not a proof of the code. It says these tests
 notice most one-line breakages in this code, and the table says which they do not.
 
-**Test-environment note.** The tests compare the host clock with the database's own `now()`
-and allow only about one second between them. A database in a VM whose clock has drifted
-(this happened after a WSL restart) fails the sweep tests with `checked: 0`, which looks
-like a code bug and is not. Sync the database host's clock before trusting such a failure.
+**Test-environment note.** `push_started_at` is stamped by the database's `now()`, while the
+tests build virtual time on the test process's clock. They originally allowed only about one
+second between the two, so a database in a VM whose clock had drifted (this happened after a
+WSL restart) failed the sweep tests with `checked: 0`, which looks like a code bug and is
+not. The margin is now `CLOCK_SKEW_MARGIN` (15 s) in `reconcile.test.ts`, and the suite was
+run with the database clock 8 s ahead, 8 s behind and in sync, passing all 125 each time.
+A disagreement larger than ~15 s would still fail those tests the same way.
 
 Harness bug found on the way: `freshDb()` ran in every `beforeEach` and opened a new pool of
 20 connections each time, closing only the last. Against a Postgres with `max_connections =
 100` the suite failed partway with "remaining connection slots are reserved". It now reuses
 one pool per file. This probably also explains the single unexplained worker crash seen in
 the first run of the new tests, though that was not reproduced to confirm.
+
+## chargeAgain (Weekend 5)
+
+The rule from the top of this document: never silently re-push. `chargeAgain(id,
+{ acknowledgeDuplicateRisk: true })` is the explicit escape hatch for a charge whose first push
+is genuinely unknown. It is the one operation in the library that can take a customer's money
+twice, so the design is mostly about limiting how, and saying so when it happens anyway.
+
+### A retry is a new row, not a mutation
+
+The first design question was where the second push's `CheckoutRequestID` goes. A charge holds
+exactly one id, and the first prompt may still be live. Overwriting it would orphan a late
+callback for the first prompt, which is the exact failure the whole library exists to prevent.
+So a retry is a **child charge**: its own row, its own id, `root_id` pointing at the first charge
+of the chain, `attempt` counting along it (`migrations/004_retry.sql`). A callback for either
+prompt binds to the row that owns that id. The old charge is not touched.
+
+### Exactly one prompt per request
+
+The child's idempotency key is derived from the parent's (`<key>#again`). Asking twice names the
+same row, and `insertIntent`'s `ON CONFLICT` makes exactly one of several racing callers the
+creator, so only one pushes. There are two layers, and they are not redundant: an early
+read-only lookup returns an existing retry even when the parent has since resolved, and the
+`created` flag decides a race the early lookup missed. Each is needed in a case the other cannot
+cover; the mutation check below is what showed that.
+
+### Where it is refused, and why before writing
+
+Only `push_unknown` and `unresolved` are retryable. `awaiting_callback` has a live prompt the
+reconciler is chasing, `pending` may be in flight, `settled` was paid, and `failed` is a
+definite answer, so retrying it is just a new `charge()`.
+
+The first version inserted the child row and then closed it as `failed` when refusing. That was
+a bug I wrote and found while writing the tests: the leftover row sits under the derived key, so
+if the parent later became `unresolved`, the next legitimate `chargeAgain` would find it and
+return it as a replay instead of pushing. Refusals now happen before anything is written, and a
+test pins that.
+
+### Both prompts paid
+
+Nothing can prevent it: the first prompt can be paid at any moment, including while the retry's
+push is on the wire, and Safaricom offers no way to cancel it. So it is detected instead. After a
+charge's settlement commits, `settledInChain()` looks for another settled charge in its chain; if
+there is one, a `discrepancy` (`reason: 'duplicate_payment'`, with the other ids) is written to
+the outbox. The check runs **after** commit, never before. If two members settle at the same
+instant, each commits and then looks, so at least one is guaranteed to see the other; checking
+first could let both miss. Nothing is reversed, because only a person can refund. The README
+tells integrators to fulfil on `rootId ?? id` so a doubly-prompted payment is fulfilled once.
+
+### How this was checked
+
+20 tests, then 22 after the check below. The retry code was then broken seven ways by hand (no
+duplicate check, race loser also pushes, state guard removed, no replay lookup, root not
+preserved, acknowledgement not enforced, chain query counting itself) and the new test file
+rerun against each. Five were caught at once. **Two survived**, the race-loser check and the
+early lookup, because each covered for the other in every test I had written. Two tests were
+added, one for each case only that guard handles, and all seven are now caught. This was a
+manual check, not Stryker; `stryker.config.json` does not yet include this code.
+
+### Known limits
+
+- **No public way to resolve a charge by hand.** `manual_resolve` exists in the state machine
+  and is property-tested there, but `Reliable` does not expose it. A charge left `unresolved`
+  stays that way unless a late callback settles it. This predates `chargeAgain`, which makes it
+  more visible; it is the next obvious gap.
+- The window between "decided to retry" and "push on the wire" cannot be closed (above). The
+  `duplicate_payment` event is the backstop, not a prevention.
+- The parent is deliberately left alone, so a `push_unknown` parent still moves to `unresolved`
+  at its deadline and raises its own event. A retried payment therefore produces an `unresolved`
+  event for the old charge as well as whatever the retry does.
 
 ## Property tests to write first (Weekend 1)
 
