@@ -21,6 +21,31 @@ export class IdempotencyConflictError extends Error {
   }
 }
 
+/**
+ * `chargeAgain()` was refused because a second prompt is not safe or not meaningful right now:
+ * the charge is not in a state where its first push is genuinely unknown, or it resolved while
+ * the retry was being set up. Nothing was sent to the customer.
+ */
+export class NotRetryableError extends Error {
+  constructor(
+    readonly chargeId: string,
+    readonly state: State,
+    detail: string,
+  ) {
+    super(`charge ${chargeId} (${state}) cannot be charged again: ${detail}`);
+    this.name = 'NotRetryableError';
+  }
+}
+
+export interface ChargeAgainOptions {
+  /**
+   * Must be the literal `true`. A re-push after an ambiguous outcome can put a SECOND prompt on a
+   * customer's phone while the first is still live; if they pay both, you have taken the money
+   * twice. The flag is here so that decision is visible in your code, not defaulted into it.
+   */
+  acknowledgeDuplicateRisk: true;
+}
+
 export interface ChargeInput {
   idempotencyKey: string;
   /** E.164 digits without '+', e.g. 254712345678. */
@@ -130,6 +155,20 @@ export interface DispatchResult {
 
 export interface Reliable {
   charge(input: ChargeInput): Promise<ChargeResult>;
+  /**
+   * A deliberate re-push for a charge whose first push is genuinely unknown (`push_unknown`, or
+   * `unresolved`), with the same phone, amount and reference. It is a NEW charge linked to the
+   * old one by `rootId`, because the first prompt may still be live: its CheckoutRequestID stays
+   * on its own row and a late callback for it still binds. The old charge is left exactly as it
+   * is; resolve it yourself once you know whether that prompt was paid.
+   *
+   * Idempotent: asking again for the same charge returns the same retry (`replayed: true`) and
+   * never prompts twice, even when two calls race. To retry the retry, call it on the retry.
+   *
+   * Throws `NotRetryableError` for any other state. If BOTH prompts end up paid, the second to
+   * settle raises a `duplicate_payment` discrepancy event; fulfil on `charge.rootId ?? charge.id`.
+   */
+  chargeAgain(chargeId: string, opts: ChargeAgainOptions): Promise<ChargeResult>;
   /**
    * Always resolves for any input a caller might receive (bad body, wrong IP, unknown id,
    * duplicate) so the route can answer 200: Safaricom never retries. It rejects only when
@@ -289,6 +328,46 @@ export function createReliableDaraja(opts: ReliableOptions): Reliable {
   }
 
   /**
+   * A payment that was prompted twice (`chargeAgain`) can be paid twice. Checked AFTER this
+   * charge's own settlement has committed, never before: if two members of a chain settle at the
+   * same moment, each commits and then looks, so at least one is guaranteed to see the other.
+   * Nothing is reversed; a person is told, because only they can refund.
+   */
+  async function flagDuplicatePayment(settled: Charge): Promise<void> {
+    const others = await store.settledInChain(settled.id);
+    if (others.length === 0) return;
+    await store.appendOutbox({
+      chargeId: settled.id,
+      type: 'discrepancy',
+      payload: { source: 'retry_chain', reason: 'duplicate_payment', otherSettledChargeIds: others.map((o) => o.id) },
+    });
+  }
+
+  /**
+   * Send the push for a row we just created, and record what happened. The transport call is
+   * isolated so a store error while RECORDING the outcome is never mistaken for a transport
+   * outcome: it propagates rather than being read as a push failure. Where that leaves the row
+   * depends on how far apply() got — still `pending`, for recover() to pick up, or already
+   * transitioned with only the audit write lost. Either way the state is never a lie about the
+   * push. A definitive refusal fails the charge; anything else may have reached the customer.
+   */
+  async function pushAndRecord(row: Charge): Promise<Charge> {
+    let outcome: Event;
+    let patch: { checkoutRequestId?: string } | undefined;
+    try {
+      const r = await transport.stkPush({ phone: row.phone, amount: row.amount, accountRef: row.accountRef });
+      outcome = { type: 'push_accepted', checkoutRequestId: r.checkoutRequestId };
+      patch = { checkoutRequestId: r.checkoutRequestId };
+    } catch (err) {
+      outcome =
+        err instanceof PushRejectedError
+          ? { type: 'push_rejected', reason: err.message }
+          : { type: 'push_ambiguous' };
+    }
+    return (await apply(row, outcome, patch)).charge;
+  }
+
+  /**
    * Run an event through the pure machine, then compare-and-set it into the store.
    * `applied` is true only for the single caller whose CAS won.
    *
@@ -331,6 +410,7 @@ export function createReliableDaraja(opts: ReliableOptions): Reliable {
           chargeId: c.id, checkoutRequestId: updated.checkoutRequestId, kind: 'transition',
           event: e, fromState: c.state, toState: to, rawPayload: null, at: now(),
         });
+        if (to === 'settled') await flagDuplicatePayment(updated);
         return { charge: updated, applied: true };
       }
 
@@ -362,26 +442,52 @@ export function createReliableDaraja(opts: ReliableOptions): Reliable {
         return { ...view(row), replayed: true };
       }
 
-      // 2. Only the caller that created the row pushes. Map the outcome conservatively:
-      //    a definitive refusal fails the charge; anything else may have reached the customer.
-      //    The transport call is isolated so that a store error while RECORDING the outcome
-      //    is never mistaken for a transport outcome: it propagates rather than being read
-      //    as a push failure. Where that leaves the row depends on how far apply() got —
-      //    still `pending`, for recover() to pick up, or already transitioned with only the
-      //    audit write lost. Either way the state is never a lie about the push.
-      let outcome: Event;
-      let patch: { checkoutRequestId?: string } | undefined;
-      try {
-        const r = await transport.stkPush({ phone: input.phone, amount: input.amount, accountRef: input.accountRef });
-        outcome = { type: 'push_accepted', checkoutRequestId: r.checkoutRequestId };
-        patch = { checkoutRequestId: r.checkoutRequestId };
-      } catch (err) {
-        outcome =
-          err instanceof PushRejectedError
-            ? { type: 'push_rejected', reason: err.message }
-            : { type: 'push_ambiguous' };
+      // 2. Only the caller that created the row pushes.
+      return view(await pushAndRecord(row));
+    },
+
+    async chargeAgain(chargeId, o) {
+      if (o?.acknowledgeDuplicateRisk !== true) {
+        throw new ValidationError('chargeAgain requires { acknowledgeDuplicateRisk: true }');
       }
-      return view((await apply(row, outcome, patch)).charge);
+      const parent = await store.get(chargeId);
+      if (!parent) throw new ValidationError(`charge ${chargeId} not found`);
+
+      // The retry's key is derived from the parent's, so asking twice names the same row. A retry
+      // that already exists is returned as it is, whatever state the parent has reached since.
+      const key = `${parent.idempotencyKey}#again`;
+      const existing = await store.getByIdempotencyKey(key);
+      if (existing) return { ...view(existing), replayed: true };
+
+      // Only where the first push is genuinely unknown. `awaiting_callback` has a live prompt
+      // the reconciler is already chasing; `pending` may still be in flight; `settled` was paid;
+      // `failed` is a definite answer, and a retry of a refusal is just a new charge() of yours.
+      // Refused BEFORE anything is written, so a refusal leaves no row behind to block a later,
+      // legitimate retry. The parent can still move while the push is on the wire; that window
+      // cannot be closed, because Safaricom may settle the first prompt at any moment.
+      if (parent.state !== 'push_unknown' && parent.state !== 'unresolved') {
+        throw new NotRetryableError(parent.id, parent.state, 'its first push is not in an unknown state');
+      }
+
+      // insertIntent's ON CONFLICT makes exactly one of several racing callers the creator, and
+      // so the only one that pushes.
+      const { charge: child, created } = await store.insertIntent({
+        idempotencyKey: key,
+        fingerprint: parent.fingerprint,
+        phone: parent.phone,
+        amount: parent.amount,
+        accountRef: parent.accountRef,
+        rootId: parent.rootId ?? parent.id,
+        attempt: parent.attempt + 1,
+      });
+      if (!created) return { ...view(child), replayed: true }; // lost the race: someone else pushes
+
+      await store.appendAudit({
+        chargeId: parent.id, checkoutRequestId: parent.checkoutRequestId, kind: 'retry',
+        event: null, fromState: parent.state, toState: null,
+        rawPayload: JSON.stringify({ retriedAs: child.id, attempt: child.attempt }), at: now(),
+      });
+      return view(await pushAndRecord(child));
     },
 
     async handleCallback({ rawBody, sourceIp }) {
