@@ -16,6 +16,7 @@ interface Row {
   checkout_request_id: string | null;
   receipt: string | null;
   attempt: number;
+  root_id: string | null;
   query_failures: number;
   push_started_at: Date;
   claimed_until: Date | null;
@@ -34,6 +35,7 @@ const toCharge = (r: Row): Charge => ({
   checkoutRequestId: r.checkout_request_id,
   receipt: r.receipt,
   attempt: r.attempt,
+  rootId: r.root_id,
   queryFailures: r.query_failures,
   pushStartedAt: r.push_started_at,
   claimedUntil: r.claimed_until,
@@ -57,11 +59,11 @@ export class PostgresStore implements Store {
     // ON CONFLICT DO NOTHING blocks on a concurrent uncommitted insert of the same key,
     // then skips; the SELECT below (a fresh statement) sees the winner's committed row.
     const ins = await this.pool.query<Row>(
-      `INSERT INTO dr_charges (idempotency_key, fingerprint, phone, amount, account_ref, state)
-       VALUES ($1, $2, $3, $4, $5, 'pending')
+      `INSERT INTO dr_charges (idempotency_key, fingerprint, phone, amount, account_ref, state, root_id, attempt)
+       VALUES ($1, $2, $3, $4, $5, 'pending', $6, COALESCE($7, 1))
        ON CONFLICT (idempotency_key) DO NOTHING
        RETURNING *`,
-      [c.idempotencyKey, c.fingerprint, c.phone, c.amount, c.accountRef],
+      [c.idempotencyKey, c.fingerprint, c.phone, c.amount, c.accountRef, c.rootId ?? null, c.attempt ?? null],
     );
     if (ins.rows[0]) return { charge: toCharge(ins.rows[0]), created: true };
 
@@ -75,6 +77,11 @@ export class PostgresStore implements Store {
 
   async get(id: string): Promise<Charge | null> {
     const r = await this.pool.query<Row>('SELECT * FROM dr_charges WHERE id = $1', [id]);
+    return r.rows[0] ? toCharge(r.rows[0]) : null;
+  }
+
+  async getByIdempotencyKey(key: string): Promise<Charge | null> {
+    const r = await this.pool.query<Row>('SELECT * FROM dr_charges WHERE idempotency_key = $1', [key]);
     return r.rows[0] ? toCharge(r.rows[0]) : null;
   }
 
@@ -168,6 +175,19 @@ export class PostgresStore implements Store {
     return r.rows
       .map((x) => ({ id: x.id, chargeId: x.charge_id, type: x.type, payload: x.payload, attempts: x.attempts }))
       .sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+  }
+
+  async settledInChain(id: string): Promise<Charge[]> {
+    // A chain is the root plus every row whose root_id points at it; COALESCE(root_id, id)
+    // names the chain from any member. An ordinary charge is a chain of one, so this is empty.
+    const r = await this.pool.query<Row>(
+      `SELECT o.* FROM dr_charges me
+         JOIN dr_charges o ON COALESCE(o.root_id, o.id) = COALESCE(me.root_id, me.id)
+        WHERE me.id = $1 AND o.id <> me.id AND o.state = 'settled'
+        ORDER BY o.attempt`,
+      [id],
+    );
+    return r.rows.map(toCharge);
   }
 
   async markDelivered(id: string, at: Date): Promise<void> {
