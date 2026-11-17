@@ -1,5 +1,5 @@
-export { createReliableDaraja, IdempotencyConflictError, ValidationError, fingerprint } from './reliable.js';
-export type { ChargeInput, ChargeResult, CallbackInput, CallbackResult, CallbackReason, Reliable, ReliableOptions, ReconcileResult, DispatchResult, EventHandler, EventMeta } from './reliable.js';
+export { createReliableDaraja, IdempotencyConflictError, NotRetryableError, ValidationError, fingerprint } from './reliable.js';
+export type { ChargeInput, ChargeAgainOptions, ChargeResult, CallbackInput, CallbackResult, CallbackReason, Reliable, ReliableOptions, ReconcileResult, DispatchResult, EventHandler, EventMeta } from './reliable.js';
 export { buildIpMatcher } from './ip.js';
 export { parseStkCallback } from './callback.js';
 export type { ParsedCallback } from './callback.js';
