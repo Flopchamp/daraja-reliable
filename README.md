@@ -19,7 +19,7 @@ outcome is genuinely unknowable ends up in front of a person instead of being gu
 
 ## Status
 
-**v0, not published to npm.** Usable, but read this list before depending on it.
+**Published on npm; pre-1.0.** Usable, but read this list before depending on it.
 
 | | |
 |---|---|

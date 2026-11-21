@@ -1,6 +1,6 @@
 {
   "name": "daraja-reliable",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Idempotency, replay protection and reconciliation for M-Pesa STK Push, above any Daraja SDK.",
   "license": "MIT",
   "author": "Harrison Onyango Aloo",
@@ -33,7 +33,8 @@
     "./testing": {
       "types": "./dist/testing/fake-daraja.d.ts",
       "default": "./dist/testing/fake-daraja.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist",
